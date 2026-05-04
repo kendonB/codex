@@ -52,6 +52,7 @@ mod thread_rollback;
 mod thread_shell_command;
 mod thread_start;
 mod thread_status;
+mod thread_superplan_commit;
 mod thread_unarchive;
 mod thread_unsubscribe;
 mod turn_interrupt;
