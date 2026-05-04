@@ -25,9 +25,23 @@ pub type StateDbHandle = Arc<codex_state::StateRuntime>;
 /// Initialize the state runtime for thread state persistence and backfill checks.
 pub async fn init(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
     let config = RolloutConfig::from_view(config);
+    init_with_roots(
+        config.codex_home,
+        config.sqlite_home,
+        config.model_provider_id,
+    )
+    .await
+}
+
+/// Initialize the state runtime for a local thread store.
+pub async fn init_with_roots(
+    codex_home: PathBuf,
+    sqlite_home: PathBuf,
+    default_model_provider_id: String,
+) -> Option<StateDbHandle> {
     let runtime = match codex_state::StateRuntime::init(
-        config.sqlite_home.clone(),
-        config.model_provider_id.clone(),
+        sqlite_home.clone(),
+        default_model_provider_id.clone(),
     )
     .await
     {
@@ -35,7 +49,7 @@ pub async fn init(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
         Err(err) => {
             warn!(
                 "failed to initialize state runtime at {}: {err}",
-                config.sqlite_home.display()
+                sqlite_home.display()
             );
             return None;
         }
@@ -45,16 +59,20 @@ pub async fn init(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
         Err(err) => {
             warn!(
                 "failed to read backfill state at {}: {err}",
-                config.codex_home.display()
+                codex_home.display()
             );
             return None;
         }
     };
     if backfill_state.status != codex_state::BackfillStatus::Complete {
         let runtime_for_backfill = runtime.clone();
-        let config = config.clone();
         tokio::spawn(async move {
-            metadata::backfill_sessions(runtime_for_backfill.as_ref(), &config).await;
+            metadata::backfill_sessions(
+                runtime_for_backfill.as_ref(),
+                codex_home.as_path(),
+                default_model_provider_id.as_str(),
+            )
+            .await;
         });
     }
     Some(runtime)
@@ -191,6 +209,7 @@ pub async fn list_threads_db(
     sort_direction: SortDirection,
     allowed_sources: &[SessionSource],
     model_providers: Option<&[String]>,
+    cwd_filters: Option<&[PathBuf]>,
     archived: bool,
     search_term: Option<&str>,
 ) -> Option<codex_state::ThreadsPage> {
@@ -213,6 +232,12 @@ pub async fn list_threads_db(
         })
         .collect();
     let model_providers = model_providers.map(<[String]>::to_vec);
+    let normalized_cwd_filters = cwd_filters.map(|filters| {
+        filters
+            .iter()
+            .map(|cwd| normalize_cwd_for_state_db(cwd))
+            .collect::<Vec<_>>()
+    });
     match ctx
         .list_threads(
             page_size,
@@ -220,6 +245,7 @@ pub async fn list_threads_db(
                 archived_only: archived,
                 allowed_sources: allowed_sources.as_slice(),
                 model_providers: model_providers.as_deref(),
+                cwd_filters: normalized_cwd_filters.as_deref(),
                 anchor: anchor.as_ref(),
                 sort_key: match sort_key {
                     ThreadSortKey::CreatedAt => codex_state::SortKey::CreatedAt,
@@ -479,7 +505,7 @@ pub async fn read_repair_rollout_path(
 pub async fn apply_rollout_items(
     context: Option<&codex_state::StateRuntime>,
     rollout_path: &Path,
-    _default_provider: &str,
+    default_provider: &str,
     builder: Option<&ThreadMetadataBuilder>,
     items: &[RolloutItem],
     stage: &str,
@@ -503,6 +529,9 @@ pub async fn apply_rollout_items(
             }
         },
     };
+    if builder.model_provider.is_none() {
+        builder.model_provider = Some(default_provider.to_string());
+    }
     builder.rollout_path = rollout_path.to_path_buf();
     builder.cwd = normalize_cwd_for_state_db(&builder.cwd);
     if let Err(err) = ctx

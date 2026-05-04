@@ -200,7 +200,6 @@ async fn thread_superplan_commit_emits_replayable_plan_turn_and_is_idempotent() 
         content: vec![ContentItem::OutputText {
             text: FINAL_PLAN.to_string(),
         }],
-        end_turn: None,
         phase: Some(MessagePhase::FinalAnswer),
     })?;
     assert!(

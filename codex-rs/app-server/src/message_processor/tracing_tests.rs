@@ -1,6 +1,7 @@
 use super::ConnectionSessionState;
 use super::MessageProcessor;
 use super::MessageProcessorArgs;
+use crate::analytics_utils::analytics_events_client_from_config;
 use crate::config_manager::ConfigManager;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingMessageSender;
@@ -27,10 +28,10 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::UserInput;
 use codex_arg0::Arg0DispatchPaths;
+use codex_config::CloudRequirementsLoader;
+use codex_config::LoaderOverrides;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
-use codex_core::config_loader::CloudRequirementsLoader;
-use codex_core::config_loader::LoaderOverrides;
 use codex_exec_server::EnvironmentManager;
 use codex_feedback::CodexFeedback;
 use codex_login::AuthManager;
@@ -48,6 +49,7 @@ use opentelemetry_sdk::trace::SpanData;
 use pretty_assertions::assert_eq;
 use serial_test::serial;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -126,7 +128,7 @@ impl TracingHarness {
         let server = create_mock_responses_server_repeating_assistant("Done").await;
         let codex_home = TempDir::new()?;
         let config = Arc::new(build_test_config(codex_home.path(), &server.uri()).await?);
-        let (processor, outgoing_rx) = build_test_processor(config);
+        let (processor, outgoing_rx) = build_test_processor(config).await;
         let tracing = init_test_tracing();
         tracing.exporter.reset();
         tracing::callsite::rebuild_interest_cache();
@@ -187,7 +189,7 @@ impl TracingHarness {
             .process_request(
                 TEST_CONNECTION_ID,
                 request,
-                AppServerTransport::Stdio,
+                &AppServerTransport::Stdio,
                 Arc::clone(&self.session),
             )
             .await;
@@ -210,7 +212,7 @@ impl TracingHarness {
             .process_request(
                 TEST_CONNECTION_ID,
                 request,
-                AppServerTransport::Stdio,
+                &AppServerTransport::Stdio,
                 Arc::clone(&self.session),
             )
             .await;
@@ -256,16 +258,15 @@ async fn build_test_config(codex_home: &Path, server_uri: &str) -> Result<Config
         .await?)
 }
 
-fn build_test_processor(
+async fn build_test_processor(
     config: Arc<Config>,
 ) -> (
     Arc<MessageProcessor>,
     mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
 ) {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
-    let outgoing = Arc::new(OutgoingMessageSender::new(outgoing_tx));
     let auth_manager =
-        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false);
+        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false).await;
     let config_manager = ConfigManager::new(
         config.codex_home.to_path_buf(),
         Vec::new(),
@@ -274,8 +275,15 @@ fn build_test_processor(
         Arg0DispatchPaths::default(),
         Arc::new(codex_config::NoopThreadConfigLoader),
     );
+    let analytics_events_client =
+        analytics_events_client_from_config(Arc::clone(&auth_manager), config.as_ref());
+    let outgoing = Arc::new(OutgoingMessageSender::new(
+        outgoing_tx,
+        analytics_events_client.clone(),
+    ));
     let processor = Arc::new(MessageProcessor::new(MessageProcessorArgs {
         outgoing,
+        analytics_events_client,
         arg0_paths: Arg0DispatchPaths::default(),
         config,
         config_manager,
@@ -287,8 +295,31 @@ fn build_test_processor(
         auth_manager,
         rpc_transport: AppServerRpcTransport::Stdio,
         remote_control_handle: None,
+        plugin_startup_tasks: crate::PluginStartupTasks::Start,
     }));
     (processor, outgoing_rx)
+}
+
+fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Result<()>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    const TEST_STACK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+
+    let handle = std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(TEST_STACK_SIZE_BYTES)
+        .spawn(move || -> Result<()> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(Box::pin(future))
+        })?;
+
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!("{name} thread panicked")),
+    }
 }
 
 fn span_attr<'a>(span: &'a SpanData, key: &str) -> Option<&'a str> {
@@ -568,83 +599,96 @@ where
     spans.into_iter().skip(baseline_len).collect()
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[test]
 #[serial(app_server_tracing)]
-async fn thread_start_jsonrpc_span_exports_server_span_and_parents_children() -> Result<()> {
-    let mut harness = TracingHarness::new().await?;
+fn thread_start_jsonrpc_span_exports_server_span_and_parents_children() -> Result<()> {
+    run_current_thread_test_with_stack(
+        "thread_start_jsonrpc_span_exports_server_span_and_parents_children",
+        async {
+            let mut harness = TracingHarness::new().await?;
 
-    let RemoteTrace {
-        trace_id: remote_trace_id,
-        parent_span_id: remote_parent_span_id,
-        context: remote_trace,
-        ..
-    } = RemoteTrace::new("00000000000000000000000000000011", "0000000000000022");
+            let RemoteTrace {
+                trace_id: remote_trace_id,
+                parent_span_id: remote_parent_span_id,
+                context: remote_trace,
+                ..
+            } = RemoteTrace::new("00000000000000000000000000000011", "0000000000000022");
 
-    let _: ThreadStartResponse = harness
-        .start_thread(/*request_id*/ 20_002, /*trace*/ None)
-        .await;
-    let untraced_spans = wait_for_exported_spans(harness.tracing, |spans| {
-        spans.iter().any(|span| {
-            span.span_kind == SpanKind::Server
-                && span_attr(span, "rpc.method") == Some("thread/start")
-        })
-    })
-    .await;
-    let untraced_server_span = find_rpc_span_with_trace(
-        &untraced_spans,
-        SpanKind::Server,
-        "thread/start",
-        untraced_spans
-            .iter()
-            .rev()
-            .find(|span| {
-                span.span_kind == SpanKind::Server
-                    && span_attr(span, "rpc.system") == Some("jsonrpc")
-                    && span_attr(span, "rpc.method") == Some("thread/start")
+            let _: ThreadStartResponse = harness
+                .start_thread(/*request_id*/ 20_002, /*trace*/ None)
+                .await;
+            let untraced_spans = wait_for_exported_spans(harness.tracing, |spans| {
+                spans.iter().any(|span| {
+                    span.span_kind == SpanKind::Server
+                        && span_attr(span, "rpc.method") == Some("thread/start")
+                })
             })
-            .unwrap_or_else(|| {
-                panic!(
-                    "missing latest thread/start server span; exported spans:\n{}",
-                    format_spans(&untraced_spans)
-                )
+            .await;
+            let untraced_server_span = find_rpc_span_with_trace(
+                &untraced_spans,
+                SpanKind::Server,
+                "thread/start",
+                untraced_spans
+                    .iter()
+                    .rev()
+                    .find(|span| {
+                        span.span_kind == SpanKind::Server
+                            && span_attr(span, "rpc.system") == Some("jsonrpc")
+                            && span_attr(span, "rpc.method") == Some("thread/start")
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing latest thread/start server span; exported spans:\n{}",
+                            format_spans(&untraced_spans)
+                        )
+                    })
+                    .span_context
+                    .trace_id(),
+            );
+            assert_has_internal_descendant_at_min_depth(
+                &untraced_spans,
+                untraced_server_span,
+                /*min_depth*/ 1,
+            );
+
+            let baseline_len = untraced_spans.len();
+            let _: ThreadStartResponse = harness
+                .start_thread(/*request_id*/ 20_003, Some(remote_trace))
+                .await;
+            let spans = wait_for_new_exported_spans(harness.tracing, baseline_len, |spans| {
+                spans.iter().any(|span| {
+                    span.span_kind == SpanKind::Server
+                        && span_attr(span, "rpc.method") == Some("thread/start")
+                        && span.span_context.trace_id() == remote_trace_id
+                }) && spans.iter().any(|span| {
+                    span.name.as_ref() == "app_server.thread_start.notify_started"
+                        && span.span_context.trace_id() == remote_trace_id
+                })
             })
-            .span_context
-            .trace_id(),
-    );
-    assert_has_internal_descendant_at_min_depth(
-        &untraced_spans,
-        untraced_server_span,
-        /*min_depth*/ 1,
-    );
+            .await;
 
-    let baseline_len = untraced_spans.len();
-    let _: ThreadStartResponse = harness
-        .start_thread(/*request_id*/ 20_003, Some(remote_trace))
-        .await;
-    let spans = wait_for_new_exported_spans(harness.tracing, baseline_len, |spans| {
-        spans.iter().any(|span| {
-            span.span_kind == SpanKind::Server
-                && span_attr(span, "rpc.method") == Some("thread/start")
-                && span.span_context.trace_id() == remote_trace_id
-        }) && spans.iter().any(|span| {
-            span.name.as_ref() == "app_server.thread_start.notify_started"
-                && span.span_context.trace_id() == remote_trace_id
-        })
-    })
-    .await;
+            let server_request_span =
+                find_rpc_span_with_trace(&spans, SpanKind::Server, "thread/start", remote_trace_id);
+            assert_eq!(server_request_span.name.as_ref(), "thread/start");
+            assert_eq!(server_request_span.parent_span_id, remote_parent_span_id);
+            assert!(server_request_span.parent_span_is_remote);
+            assert_eq!(server_request_span.span_context.trace_id(), remote_trace_id);
+            assert_ne!(server_request_span.span_context.span_id(), SpanId::INVALID);
+            assert_has_internal_descendant_at_min_depth(
+                &spans,
+                server_request_span,
+                /*min_depth*/ 1,
+            );
+            assert_has_internal_descendant_at_min_depth(
+                &spans,
+                server_request_span,
+                /*min_depth*/ 2,
+            );
+            harness.shutdown().await;
 
-    let server_request_span =
-        find_rpc_span_with_trace(&spans, SpanKind::Server, "thread/start", remote_trace_id);
-    assert_eq!(server_request_span.name.as_ref(), "thread/start");
-    assert_eq!(server_request_span.parent_span_id, remote_parent_span_id);
-    assert!(server_request_span.parent_span_is_remote);
-    assert_eq!(server_request_span.span_context.trace_id(), remote_trace_id);
-    assert_ne!(server_request_span.span_context.span_id(), SpanId::INVALID);
-    assert_has_internal_descendant_at_min_depth(&spans, server_request_span, /*min_depth*/ 1);
-    assert_has_internal_descendant_at_min_depth(&spans, server_request_span, /*min_depth*/ 2);
-    harness.shutdown().await;
-
-    Ok(())
+            Ok(())
+        },
+    )
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -717,6 +761,7 @@ async fn turn_start_jsonrpc_span_parents_core_turn_spans() -> Result<()> {
                     cwd: None,
                     approval_policy: None,
                     sandbox_policy: None,
+                    permissions: None,
                     approvals_reviewer: None,
                     model: None,
                     service_tier: None,

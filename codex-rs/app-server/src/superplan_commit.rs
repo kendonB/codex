@@ -232,7 +232,6 @@ fn agent_message_response_item(text: String, phase: Option<MessagePhase>) -> Res
         id: None,
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText { text }],
-        end_turn: None,
         phase,
     }
 }
@@ -350,6 +349,7 @@ fn turn_complete(turn_id: String, now: i64) -> TurnCompleteEvent {
         last_agent_message: None,
         completed_at: Some(now),
         duration_ms: Some(0),
+        time_to_first_token_ms: None,
     }
 }
 

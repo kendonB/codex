@@ -48,7 +48,7 @@ pub(super) async fn archive_thread(
         }
     })?;
 
-    if let Some(ctx) = codex_rollout::state_db::get_state_db(&store.config).await {
+    if let Some(ctx) = store.state_db().await {
         let _ = ctx
             .mark_archived(thread_id, archived_path.as_path(), Utc::now())
             .await;
@@ -103,8 +103,10 @@ mod tests {
                 sort_direction: crate::SortDirection::Desc,
                 allowed_sources: Vec::new(),
                 model_providers: None,
+                cwd_filters: None,
                 archived: true,
                 search_term: None,
+                use_state_db_only: false,
             })
             .await
             .expect("archived listing");
@@ -128,7 +130,7 @@ mod tests {
             write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
         let runtime = codex_state::StateRuntime::init(
             home.path().to_path_buf(),
-            config.model_provider_id.clone(),
+            config.default_model_provider_id.clone(),
         )
         .await
         .expect("state db should initialize");
@@ -142,10 +144,10 @@ mod tests {
             Utc::now(),
             SessionSource::Cli,
         );
-        builder.model_provider = Some(config.model_provider_id.clone());
+        builder.model_provider = Some(config.default_model_provider_id.clone());
         builder.cwd = home.path().to_path_buf();
         builder.cli_version = Some("test_version".to_string());
-        let metadata = builder.build(config.model_provider_id.as_str());
+        let metadata = builder.build(config.default_model_provider_id.as_str());
         runtime
             .upsert_thread(&metadata)
             .await

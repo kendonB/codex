@@ -29,7 +29,7 @@ fn build_environment_update_item(
 
     let prev = previous?;
     let prev_context = EnvironmentContext::from_turn_context_item(prev, shell.name().to_string());
-    let next_context = EnvironmentContext::from_turn_context(next, shell);
+    let next_context = EnvironmentContext::from_turn_context(next);
     if prev_context.equals_except_shell(&next_context) {
         return None;
     }
@@ -49,15 +49,15 @@ fn build_permissions_update_item(
     }
 
     let prev = previous?;
-    if prev.sandbox_policy == *next.sandbox_policy.get()
+    if prev.permission_profile() == next.permission_profile()
         && prev.approval_policy == next.approval_policy.value()
     {
         return None;
     }
 
     Some(
-        PermissionsInstructions::from_policy(
-            next.sandbox_policy.get(),
+        PermissionsInstructions::from_permission_profile(
+            &next.permission_profile,
             next.approval_policy.value(),
             next.config.approvals_reviewer,
             exec_policy,
@@ -197,7 +197,6 @@ fn build_text_message(role: &str, text_sections: Vec<String>) -> Option<Response
         id: None,
         role: role.to_string(),
         content,
-        end_turn: None,
         phase: None,
     })
 }

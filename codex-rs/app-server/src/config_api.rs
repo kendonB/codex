@@ -1,7 +1,8 @@
 use crate::config_manager::ConfigManager;
 use crate::config_manager_service::ConfigManagerError;
-use crate::error_code::INTERNAL_ERROR_CODE;
 use crate::error_code::INVALID_REQUEST_ERROR_CODE;
+use crate::error_code::internal_error;
+use crate::error_code::invalid_request;
 use async_trait::async_trait;
 use codex_analytics::AnalyticsEventsClient;
 use codex_app_server_protocol::ConfigBatchWriteParams;
@@ -12,23 +13,30 @@ use codex_app_server_protocol::ConfigRequirementsReadResponse;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConfigWriteErrorCode;
 use codex_app_server_protocol::ConfigWriteResponse;
+use codex_app_server_protocol::ConfiguredHookHandler;
+use codex_app_server_protocol::ConfiguredHookMatcherGroup;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetParams;
 use codex_app_server_protocol::ExperimentalFeatureEnablementSetResponse;
 use codex_app_server_protocol::JSONRPCErrorError;
+use codex_app_server_protocol::ManagedHooksRequirements;
 use codex_app_server_protocol::NetworkDomainPermission;
 use codex_app_server_protocol::NetworkRequirements;
 use codex_app_server_protocol::NetworkUnixSocketPermission;
 use codex_app_server_protocol::SandboxMode;
+use codex_config::ConfigRequirementsToml;
+use codex_config::HookEventsToml;
+use codex_config::HookHandlerConfig as CoreHookHandlerConfig;
+use codex_config::ManagedHooksRequirementsToml;
+use codex_config::MatcherGroup as CoreMatcherGroup;
+use codex_config::ResidencyRequirement as CoreResidencyRequirement;
+use codex_config::SandboxModeRequirement as CoreSandboxModeRequirement;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
-use codex_core::config_loader::ConfigRequirementsToml;
-use codex_core::config_loader::ResidencyRequirement as CoreResidencyRequirement;
-use codex_core::config_loader::SandboxModeRequirement as CoreSandboxModeRequirement;
-use codex_core::plugins::PluginId;
 use codex_core_plugins::loader::installed_plugin_telemetry_metadata;
 use codex_core_plugins::toggles::collect_plugin_enabled_candidates;
 use codex_features::canonical_feature_for_key;
 use codex_features::feature_for_key;
+use codex_plugin::PluginId;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::protocol::Op;
 use serde_json::json;
@@ -38,7 +46,9 @@ use tracing::warn;
 
 const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
     "apps",
+    "memories",
     "plugins",
+    "remote_control",
     "tool_search",
     "tool_suggest",
     "tool_call_mcp_elicitation",
@@ -91,10 +101,10 @@ impl ConfigApi {
         self.config_manager
             .load_latest_config(fallback_cwd)
             .await
-            .map_err(|err| JSONRPCErrorError {
-                code: INTERNAL_ERROR_CODE,
-                message: format!("failed to resolve feature override precedence: {err}"),
-                data: None,
+            .map_err(|err| {
+                internal_error(format!(
+                    "failed to resolve feature override precedence: {err}"
+                ))
             })
     }
 
@@ -189,14 +199,10 @@ impl ConfigApi {
                     continue;
                 }
 
-                return Err(JSONRPCErrorError {
-                    code: INVALID_REQUEST_ERROR_CODE,
-                    message: format!(
-                        "unsupported feature enablement `{key}`: currently supported features are {}",
-                        SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT.join(", ")
-                    ),
-                    data: None,
-                });
+                return Err(invalid_request(format!(
+                    "unsupported feature enablement `{key}`: currently supported features are {}",
+                    SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT.join(", ")
+                )));
             }
 
             let message = if let Some(feature) = feature_for_key(key) {
@@ -207,11 +213,7 @@ impl ConfigApi {
             } else {
                 format!("invalid feature enablement `{key}`")
             };
-            return Err(JSONRPCErrorError {
-                code: INVALID_REQUEST_ERROR_CODE,
-                message,
-                data: None,
-            });
+            return Err(invalid_request(message));
         }
 
         if enablement.is_empty() {
@@ -224,11 +226,7 @@ impl ConfigApi {
                     .iter()
                     .map(|(name, enabled)| (name.clone(), *enabled)),
             )
-            .map_err(|_| JSONRPCErrorError {
-                code: INTERNAL_ERROR_CODE,
-                message: "failed to update feature enablement".to_string(),
-                data: None,
-            })?;
+            .map_err(|_| internal_error("failed to update feature enablement"))?;
 
         self.load_latest_config(/*fallback_cwd*/ None).await?;
         self.user_config_reloader.reload_user_config().await;
@@ -289,10 +287,76 @@ fn map_requirements_toml_to_api(requirements: ConfigRequirementsToml) -> ConfigR
         feature_requirements: requirements
             .feature_requirements
             .map(|requirements| requirements.entries),
+        hooks: requirements.hooks.map(map_hooks_requirements_to_api),
         enforce_residency: requirements
             .enforce_residency
             .map(map_residency_requirement_to_api),
         network: requirements.network.map(map_network_requirements_to_api),
+    }
+}
+
+fn map_hooks_requirements_to_api(hooks: ManagedHooksRequirementsToml) -> ManagedHooksRequirements {
+    let ManagedHooksRequirementsToml {
+        managed_dir,
+        windows_managed_dir,
+        hooks,
+    } = hooks;
+    let HookEventsToml {
+        pre_tool_use,
+        permission_request,
+        post_tool_use,
+        session_start,
+        user_prompt_submit,
+        stop,
+    } = hooks;
+
+    ManagedHooksRequirements {
+        managed_dir,
+        windows_managed_dir,
+        pre_tool_use: map_hook_matcher_groups_to_api(pre_tool_use),
+        permission_request: map_hook_matcher_groups_to_api(permission_request),
+        post_tool_use: map_hook_matcher_groups_to_api(post_tool_use),
+        session_start: map_hook_matcher_groups_to_api(session_start),
+        user_prompt_submit: map_hook_matcher_groups_to_api(user_prompt_submit),
+        stop: map_hook_matcher_groups_to_api(stop),
+    }
+}
+
+fn map_hook_matcher_groups_to_api(
+    groups: Vec<CoreMatcherGroup>,
+) -> Vec<ConfiguredHookMatcherGroup> {
+    groups
+        .into_iter()
+        .map(map_hook_matcher_group_to_api)
+        .collect()
+}
+
+fn map_hook_matcher_group_to_api(group: CoreMatcherGroup) -> ConfiguredHookMatcherGroup {
+    ConfiguredHookMatcherGroup {
+        matcher: group.matcher,
+        hooks: group
+            .hooks
+            .into_iter()
+            .map(map_hook_handler_to_api)
+            .collect(),
+    }
+}
+
+fn map_hook_handler_to_api(handler: CoreHookHandlerConfig) -> ConfiguredHookHandler {
+    match handler {
+        CoreHookHandlerConfig::Command {
+            command,
+            timeout_sec,
+            r#async,
+            status_message,
+        } => ConfiguredHookHandler::Command {
+            command,
+            timeout_sec,
+            r#async,
+            status_message,
+        },
+        CoreHookHandlerConfig::Prompt {} => ConfiguredHookHandler::Prompt {},
+        CoreHookHandlerConfig::Agent {} => ConfiguredHookHandler::Agent {},
     }
 }
 
@@ -314,20 +378,20 @@ fn map_residency_requirement_to_api(
 }
 
 fn map_network_requirements_to_api(
-    network: codex_core::config_loader::NetworkRequirementsToml,
+    network: codex_config::NetworkRequirementsToml,
 ) -> NetworkRequirements {
     let allowed_domains = network
         .domains
         .as_ref()
-        .and_then(codex_core::config_loader::NetworkDomainPermissionsToml::allowed_domains);
+        .and_then(codex_config::NetworkDomainPermissionsToml::allowed_domains);
     let denied_domains = network
         .domains
         .as_ref()
-        .and_then(codex_core::config_loader::NetworkDomainPermissionsToml::denied_domains);
+        .and_then(codex_config::NetworkDomainPermissionsToml::denied_domains);
     let allow_unix_sockets = network
         .unix_sockets
         .as_ref()
-        .map(codex_core::config_loader::NetworkUnixSocketPermissionsToml::allow_unix_sockets)
+        .map(codex_config::NetworkUnixSocketPermissionsToml::allow_unix_sockets)
         .filter(|entries| !entries.is_empty());
 
     NetworkRequirements {
@@ -364,28 +428,20 @@ fn map_network_requirements_to_api(
 }
 
 fn map_network_domain_permission_to_api(
-    permission: codex_core::config_loader::NetworkDomainPermissionToml,
+    permission: codex_config::NetworkDomainPermissionToml,
 ) -> NetworkDomainPermission {
     match permission {
-        codex_core::config_loader::NetworkDomainPermissionToml::Allow => {
-            NetworkDomainPermission::Allow
-        }
-        codex_core::config_loader::NetworkDomainPermissionToml::Deny => {
-            NetworkDomainPermission::Deny
-        }
+        codex_config::NetworkDomainPermissionToml::Allow => NetworkDomainPermission::Allow,
+        codex_config::NetworkDomainPermissionToml::Deny => NetworkDomainPermission::Deny,
     }
 }
 
 fn map_network_unix_socket_permission_to_api(
-    permission: codex_core::config_loader::NetworkUnixSocketPermissionToml,
+    permission: codex_config::NetworkUnixSocketPermissionToml,
 ) -> NetworkUnixSocketPermission {
     match permission {
-        codex_core::config_loader::NetworkUnixSocketPermissionToml::Allow => {
-            NetworkUnixSocketPermission::Allow
-        }
-        codex_core::config_loader::NetworkUnixSocketPermissionToml::None => {
-            NetworkUnixSocketPermission::None
-        }
+        codex_config::NetworkUnixSocketPermissionToml::Allow => NetworkUnixSocketPermission::Allow,
+        codex_config::NetworkUnixSocketPermissionToml::None => NetworkUnixSocketPermission::None,
     }
 }
 
@@ -394,11 +450,7 @@ fn map_error(err: ConfigManagerError) -> JSONRPCErrorError {
         return config_write_error(code, err.to_string());
     }
 
-    JSONRPCErrorError {
-        code: INTERNAL_ERROR_CODE,
-        message: err.to_string(),
-        data: None,
-    }
+    internal_error(err.to_string())
 }
 
 fn config_write_error(code: ConfigWriteErrorCode, message: impl Into<String>) -> JSONRPCErrorError {
@@ -417,13 +469,13 @@ mod tests {
     use crate::config_manager::apply_runtime_feature_enablement;
     use codex_analytics::AnalyticsEventsClient;
     use codex_arg0::Arg0DispatchPaths;
-    use codex_core::config_loader::CloudRequirementsLoader;
-    use codex_core::config_loader::LoaderOverrides;
-    use codex_core::config_loader::NetworkDomainPermissionToml as CoreNetworkDomainPermissionToml;
-    use codex_core::config_loader::NetworkDomainPermissionsToml as CoreNetworkDomainPermissionsToml;
-    use codex_core::config_loader::NetworkRequirementsToml as CoreNetworkRequirementsToml;
-    use codex_core::config_loader::NetworkUnixSocketPermissionToml as CoreNetworkUnixSocketPermissionToml;
-    use codex_core::config_loader::NetworkUnixSocketPermissionsToml as CoreNetworkUnixSocketPermissionsToml;
+    use codex_config::CloudRequirementsLoader;
+    use codex_config::LoaderOverrides;
+    use codex_config::NetworkDomainPermissionToml as CoreNetworkDomainPermissionToml;
+    use codex_config::NetworkDomainPermissionsToml as CoreNetworkDomainPermissionsToml;
+    use codex_config::NetworkRequirementsToml as CoreNetworkRequirementsToml;
+    use codex_config::NetworkUnixSocketPermissionToml as CoreNetworkUnixSocketPermissionToml;
+    use codex_config::NetworkUnixSocketPermissionsToml as CoreNetworkUnixSocketPermissionsToml;
     use codex_features::Feature;
     use codex_login::AuthManager;
     use codex_login::CodexAuth;
@@ -458,24 +510,39 @@ mod tests {
             ]),
             allowed_approvals_reviewers: Some(vec![
                 CoreApprovalsReviewer::User,
-                CoreApprovalsReviewer::GuardianSubagent,
+                CoreApprovalsReviewer::AutoReview,
             ]),
             allowed_sandbox_modes: Some(vec![
                 CoreSandboxModeRequirement::ReadOnly,
                 CoreSandboxModeRequirement::ExternalSandbox,
             ]),
             remote_sandbox_config: None,
-            allowed_web_search_modes: Some(vec![
-                codex_core::config_loader::WebSearchModeRequirement::Cached,
-            ]),
+            allowed_web_search_modes: Some(vec![codex_config::WebSearchModeRequirement::Cached]),
             guardian_policy_config: None,
-            feature_requirements: Some(codex_core::config_loader::FeatureRequirementsToml {
+            feature_requirements: Some(codex_config::FeatureRequirementsToml {
                 entries: std::collections::BTreeMap::from([
                     ("apps".to_string(), false),
                     ("personality".to_string(), true),
                 ]),
             }),
+            hooks: Some(ManagedHooksRequirementsToml {
+                managed_dir: Some(PathBuf::from("/enterprise/hooks")),
+                windows_managed_dir: Some(PathBuf::from(r"C:\enterprise\hooks")),
+                hooks: HookEventsToml {
+                    pre_tool_use: vec![CoreMatcherGroup {
+                        matcher: Some("^Bash$".to_string()),
+                        hooks: vec![CoreHookHandlerConfig::Command {
+                            command: "python3 /enterprise/hooks/pre.py".to_string(),
+                            timeout_sec: Some(10),
+                            r#async: false,
+                            status_message: Some("checking".to_string()),
+                        }],
+                    }],
+                    ..Default::default()
+                },
+            }),
             mcp_servers: None,
+            plugins: None,
             apps: None,
             rules: None,
             enforce_residency: Some(CoreResidencyRequirement::Us),
@@ -523,7 +590,7 @@ mod tests {
             mapped.allowed_approvals_reviewers,
             Some(vec![
                 codex_app_server_protocol::ApprovalsReviewer::User,
-                codex_app_server_protocol::ApprovalsReviewer::GuardianSubagent,
+                codex_app_server_protocol::ApprovalsReviewer::AutoReview,
             ])
         );
         assert_eq!(
@@ -540,6 +607,27 @@ mod tests {
                 ("apps".to_string(), false),
                 ("personality".to_string(), true),
             ])),
+        );
+        assert_eq!(
+            mapped.hooks,
+            Some(ManagedHooksRequirements {
+                managed_dir: Some(PathBuf::from("/enterprise/hooks")),
+                windows_managed_dir: Some(PathBuf::from(r"C:\enterprise\hooks")),
+                pre_tool_use: vec![ConfiguredHookMatcherGroup {
+                    matcher: Some("^Bash$".to_string()),
+                    hooks: vec![ConfiguredHookHandler::Command {
+                        command: "python3 /enterprise/hooks/pre.py".to_string(),
+                        timeout_sec: Some(10),
+                        r#async: false,
+                        status_message: Some("checking".to_string()),
+                    }],
+                }],
+                permission_request: Vec::new(),
+                post_tool_use: Vec::new(),
+                session_start: Vec::new(),
+                user_prompt_submit: Vec::new(),
+                stop: Vec::new(),
+            }),
         );
         assert_eq!(
             mapped.enforce_residency,
@@ -581,7 +669,9 @@ mod tests {
             allowed_web_search_modes: None,
             guardian_policy_config: None,
             feature_requirements: None,
+            hooks: None,
             mcp_servers: None,
+            plugins: None,
             apps: None,
             rules: None,
             enforce_residency: None,
@@ -640,7 +730,9 @@ mod tests {
             allowed_web_search_modes: Some(Vec::new()),
             guardian_policy_config: None,
             feature_requirements: None,
+            hooks: None,
             mcp_servers: None,
+            plugins: None,
             apps: None,
             rules: None,
             enforce_residency: None,
@@ -696,11 +788,9 @@ mod tests {
             )])
             .cloud_requirements(CloudRequirementsLoader::new(async {
                 Ok(Some(ConfigRequirementsToml {
-                    feature_requirements: Some(
-                        codex_core::config_loader::FeatureRequirementsToml {
-                            entries: BTreeMap::from([("apps".to_string(), false)]),
-                        },
-                    ),
+                    feature_requirements: Some(codex_config::FeatureRequirementsToml {
+                        entries: BTreeMap::from([("apps".to_string(), false)]),
+                    }),
                     ..Default::default()
                 }))
             }))
