@@ -353,6 +353,67 @@
       ],
       "type": "object"
     },
+    "CommittedVisibleContextItem": {
+      "oneOf": [
+        {
+          "properties": {
+            "content": {
+              "items": {
+                "$ref": "#/definitions/UserInput"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "userMessage"
+              ],
+              "title": "UserMessageCommittedVisibleContextItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "content",
+            "type"
+          ],
+          "title": "UserMessageCommittedVisibleContextItem",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "agentMessage"
+              ],
+              "title": "AgentMessageCommittedVisibleContextItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "title": "AgentMessageCommittedVisibleContextItem",
+          "type": "object"
+        }
+      ]
+    },
+    "CommittedVisibleContextTurn": {
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/definitions/CommittedVisibleContextItem"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "type": "object"
+    },
     "ConfigBatchWriteParams": {
       "properties": {
         "edits": {
@@ -2918,6 +2979,29 @@
         "desc"
       ],
       "type": "string"
+    },
+    "SuperplanCommitMetadata": {
+      "properties": {
+        "originalCommandText": {
+          "type": "string"
+        },
+        "outerRoundsCompleted": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "plannerQAndACount": {
+          "format": "uint8",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "originalCommandText",
+        "outerRoundsCompleted",
+        "plannerQAndACount"
+      ],
+      "type": "object"
     },
     "TextElement": {
       "properties": {

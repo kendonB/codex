@@ -336,6 +336,12 @@ client_request_definitions! {
         params: v2::ThreadInjectItemsParams,
         response: v2::ThreadInjectItemsResponse,
     },
+    #[experimental("thread/superplan/commit")]
+    /// Commit the visible result of an App-owned Superplan workflow as a completed Plan turn.
+    ThreadSuperplanCommit => "thread/superplan/commit" {
+        params: v2::ThreadSuperplanCommitParams,
+        response: v2::ThreadSuperplanCommitResponse,
+    },
     SkillsList => "skills/list" {
         params: v2::SkillsListParams,
         response: v2::SkillsListResponse,

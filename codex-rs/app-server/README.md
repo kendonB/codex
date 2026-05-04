@@ -157,6 +157,7 @@ Example with notification opt-out:
 - `thread/rollback` — drop the last N turns from the agent’s in-memory context and persist a rollback marker in the rollout so future resumes see the pruned history; returns the updated `thread` (with `turns` populated) on success.
 - `turn/start` — add user input to a thread and begin Codex generation; responds with the initial `turn` object and streams `turn/started`, `item/*`, and `turn/completed` notifications. For `collaborationMode`, `settings.developer_instructions: null` means "use built-in instructions for the selected mode".
 - `thread/inject_items` — append raw Responses API items to a loaded thread’s model-visible history without starting a user turn; returns `{}` on success.
+- `thread/superplan/commit` — experimental; commit an app-owned `/superplan` workflow into a loaded thread as model-visible history plus a replayable completed Plan turn. Repeating the same `jobId` and `idempotencyKey` returns the existing committed item IDs without emitting duplicate notifications.
 - `turn/steer` — add user input to an already in-flight regular turn without starting a new turn; returns the active `turnId` that accepted the input. Review and manual compaction turns reject `turn/steer`.
 - `turn/interrupt` — request cancellation of an in-flight turn by `(thread_id, turn_id)`; success is an empty `{}` response and the turn finishes with `status: "interrupted"`.
 - `thread/realtime/start` — start a thread-scoped realtime session (experimental); pass `outputModality: "text"` or `outputModality: "audio"` to choose model output, returns `{}` and streams `thread/realtime/*` notifications. Omit `transport` for the websocket transport, or pass `{ "type": "webrtc", "sdp": "..." }` to create a WebRTC session from a browser-generated SDP offer; the remote answer SDP is emitted as `thread/realtime/sdp`.
@@ -639,6 +640,49 @@ Use `thread/inject_items` to append prebuilt Responses API items to a loaded thr
     ]
 } }
 { "id": 36, "result": {} }
+```
+
+### Example: Commit a Superplan result
+
+Use `thread/superplan/commit` when an app has already run a `/superplan` workflow outside the main thread and needs to materialize the visible result into that thread. The method is experimental and requires `capabilities.experimentalApi = true`.
+
+The committed context is appended to model-visible history for later turns. The final plan is also persisted as a normal completed Plan item, so `thread/read` and replay show it as ordinary Plan-mode history.
+
+```json
+{ "method": "thread/superplan/commit", "id": 37, "params": {
+    "threadId": "thr_123",
+    "jobId": "superplan-job-123",
+    "idempotencyKey": "commit-1",
+    "originalUserInput": [
+        { "type": "text", "text": "/superplan build the feature", "textElements": [] }
+    ],
+    "committedVisibleContextTurns": [
+        {
+            "items": [
+                { "type": "agentMessage", "text": "Which surface should this target?" },
+                {
+                    "type": "userMessage",
+                    "content": [
+                        { "type": "text", "text": "The TUI", "textElements": [] }
+                    ]
+                }
+            ]
+        }
+    ],
+    "finalPlanMarkdown": "1. Add the command.\n2. Commit the final Plan item.",
+    "metadata": {
+        "originalCommandText": "/superplan build the feature",
+        "outerRoundsCompleted": 1,
+        "plannerQAndACount": 1
+    }
+} }
+{ "id": 37, "result": {
+    "originalRequestTurnId": "superplan-...-request",
+    "committedVisibleContextTurnIds": ["superplan-...-context-000"],
+    "finalPlanTurnId": "superplan-...-plan-turn",
+    "finalPlanItemId": "superplan-...-plan-item",
+    "alreadyCommitted": false
+} }
 ```
 
 ### Example: Start realtime with WebRTC

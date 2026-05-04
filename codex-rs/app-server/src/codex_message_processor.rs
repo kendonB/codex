@@ -186,6 +186,7 @@ use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::ThreadStartedNotification;
 use codex_app_server_protocol::ThreadStatus;
+use codex_app_server_protocol::ThreadSuperplanCommitParams;
 use codex_app_server_protocol::ThreadTurnsListParams;
 use codex_app_server_protocol::ThreadTurnsListResponse;
 use codex_app_server_protocol::ThreadUnarchiveParams;
@@ -385,6 +386,8 @@ mod token_usage_replay;
 
 use crate::filters::compute_source_filters;
 use crate::filters::source_kind_matches;
+use crate::superplan_commit::SuperplanCommitError;
+use crate::superplan_commit::commit_superplan_completed_plan_turn;
 use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadState;
 use crate::thread_state::ThreadStateManager;
@@ -999,6 +1002,10 @@ impl CodexMessageProcessor {
             }
             ClientRequest::ThreadInjectItems { request_id, params } => {
                 self.thread_inject_items(to_connection_request_id(request_id), params)
+                    .await;
+            }
+            ClientRequest::ThreadSuperplanCommit { request_id, params } => {
+                self.thread_superplan_commit(to_connection_request_id(request_id), params)
                     .await;
             }
             ClientRequest::TurnSteer { request_id, params } => {
@@ -6847,6 +6854,37 @@ impl CodexMessageProcessor {
                     format!("failed to inject response items: {err}"),
                 )
                 .await;
+            }
+        }
+    }
+
+    async fn thread_superplan_commit(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ThreadSuperplanCommitParams,
+    ) {
+        let (_, thread) = match self.load_thread(&params.thread_id).await {
+            Ok(value) => value,
+            Err(error) => {
+                self.outgoing.send_error(request_id, error).await;
+                return;
+            }
+        };
+
+        match commit_superplan_completed_plan_turn(&thread, params).await {
+            Ok(outcome) => {
+                for notification in outcome.notifications {
+                    self.outgoing.send_server_notification(notification).await;
+                }
+                self.outgoing
+                    .send_response(request_id, outcome.response)
+                    .await;
+            }
+            Err(SuperplanCommitError::InvalidRequest(message)) => {
+                self.send_invalid_request_error(request_id, message).await;
+            }
+            Err(SuperplanCommitError::Internal(message)) => {
+                self.send_internal_error(request_id, message).await;
             }
         }
     }

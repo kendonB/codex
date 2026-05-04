@@ -4789,6 +4789,59 @@ pub struct ThreadInjectItemsParams {
 #[ts(export_to = "v2/")]
 pub struct ThreadInjectItemsResponse {}
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSuperplanCommitParams {
+    pub thread_id: String,
+    pub job_id: String,
+    pub idempotency_key: String,
+    #[ts(optional = nullable)]
+    pub original_user_input: Option<Vec<UserInput>>,
+    pub committed_visible_context_turns: Vec<CommittedVisibleContextTurn>,
+    pub final_plan_markdown: String,
+    pub metadata: SuperplanCommitMetadata,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct CommittedVisibleContextTurn {
+    pub items: Vec<CommittedVisibleContextItem>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[ts(tag = "type", export_to = "v2/")]
+pub enum CommittedVisibleContextItem {
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    UserMessage { content: Vec<UserInput> },
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
+    AgentMessage { text: String },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct SuperplanCommitMetadata {
+    pub original_command_text: String,
+    pub outer_rounds_completed: u8,
+    pub planner_q_and_a_count: u8,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSuperplanCommitResponse {
+    pub original_request_turn_id: Option<String>,
+    pub committed_visible_context_turn_ids: Vec<String>,
+    pub final_plan_turn_id: String,
+    pub final_plan_item_id: String,
+    pub already_committed: bool,
+}
+
 #[derive(
     Serialize, Deserialize, Debug, Default, Clone, PartialEq, JsonSchema, TS, ExperimentalApi,
 )]

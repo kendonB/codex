@@ -16,7 +16,9 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::Submission;
@@ -233,6 +235,23 @@ impl CodexThread {
             .await;
         self.codex.session.flush_rollout().await?;
         Ok(())
+    }
+
+    /// Append prebuilt event history to the rollout without submitting a model turn.
+    ///
+    /// This is intentionally narrow and is used by app-server APIs that need to materialize
+    /// first-class transcript state already produced outside the core turn loop.
+    pub async fn append_rollout_events(&self, events: &[EventMsg]) -> std::io::Result<()> {
+        let rollout_items = events
+            .iter()
+            .cloned()
+            .map(RolloutItem::EventMsg)
+            .collect::<Vec<_>>();
+        self.codex
+            .session
+            .persist_rollout_items(&rollout_items)
+            .await;
+        self.codex.session.flush_rollout().await
     }
 
     pub fn rollout_path(&self) -> Option<PathBuf> {

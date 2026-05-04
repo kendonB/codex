@@ -58,6 +58,8 @@ export type { CommandExecutionRequestApprovalParams } from "./CommandExecutionRe
 export type { CommandExecutionRequestApprovalResponse } from "./CommandExecutionRequestApprovalResponse";
 export type { CommandExecutionSource } from "./CommandExecutionSource";
 export type { CommandExecutionStatus } from "./CommandExecutionStatus";
+export type { CommittedVisibleContextItem } from "./CommittedVisibleContextItem";
+export type { CommittedVisibleContextTurn } from "./CommittedVisibleContextTurn";
 export type { Config } from "./Config";
 export type { ConfigBatchWriteParams } from "./ConfigBatchWriteParams";
 export type { ConfigEdit } from "./ConfigEdit";
@@ -299,6 +301,7 @@ export type { SkillsListExtraRootsForCwd } from "./SkillsListExtraRootsForCwd";
 export type { SkillsListParams } from "./SkillsListParams";
 export type { SkillsListResponse } from "./SkillsListResponse";
 export type { SortDirection } from "./SortDirection";
+export type { SuperplanCommitMetadata } from "./SuperplanCommitMetadata";
 export type { TerminalInteractionNotification } from "./TerminalInteractionNotification";
 export type { TextElement } from "./TextElement";
 export type { TextPosition } from "./TextPosition";
